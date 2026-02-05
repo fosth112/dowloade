@@ -777,8 +777,8 @@ if __name__ == "__main__":
 """
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    if ADMIN_UI_ENABLED:
+def index(ui: Optional[str] = None):
+    if ui == "admin" and ADMIN_UI_ENABLED:
         return RedirectResponse(url="/admin", status_code=307)
     return HTMLResponse(INDEX_HTML)
 
