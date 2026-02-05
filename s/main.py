@@ -1,0 +1,1141 @@
+import re
+import sqlite3
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+
+# ======================
+# Config
+# ======================
+BASE_DIR = Path(__file__).parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+DB_PATH = BASE_DIR / "app.db"
+# React Admin UI (Vite build output)
+ADMIN_DIST_DIR = BASE_DIR / "web" / "dist"
+ADMIN_UI_ENABLED = False
+
+
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+ALLOWED_EXT = {".exe", ".msi", ".zip", ".apk", ".dmg", ".pkg", ".rar", ".7z", ".tar", ".gz", ".whl", ".deb", ".rpm"}
+MAX_SIZE_MB = 4096  # 4GB
+STEALTH_MODE = True
+HIDDEN_VERSION_FILE = "version_info.dat"
+MAX_LOG_LINES = 500
+
+# ======================
+# Logging (in-memory)
+# ======================
+LOGS: List[Dict[str, Any]] = []
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def log_event(message: str):
+    LOGS.append({"ts": utc_now_iso(), "msg": message})
+    if len(LOGS) > MAX_LOG_LINES:
+        del LOGS[: len(LOGS) - MAX_LOG_LINES]
+
+# ======================
+# DB helpers
+# ======================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set:
+    rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
+    return {r[1] for r in rows}
+
+def ensure_columns(conn: sqlite3.Connection, table: str, cols: Dict[str, str]):
+    existing = table_columns(conn, table)
+    for name, ddl_type in cols.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl_type};")
+
+def init_db_and_migrate():
+    conn = db()
+    cur = conn.cursor()
+
+    # existing table files (keep for backward compatibility)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_id TEXT NOT NULL,
+        version TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        stored_path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """)
+
+    # add new columns (migration)
+    ensure_columns(conn, "files", {
+        "updated_at": "TEXT",
+        "notes": "TEXT",
+        "revision": "INTEGER DEFAULT 1",
+    })
+
+    # apps table: remember per-app settings + which build is LIVE
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS apps (
+        app_id TEXT PRIMARY KEY,
+        live_file_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_app ON files(app_id);")
+    conn.commit()
+    conn.close()
+
+# ======================
+# Version compare
+# ======================
+def is_valid_version(v: str) -> bool:
+    return bool(re.fullmatch(r"[0-9A-Za-z.\-_]+", v.strip()))
+
+def version_key(v: str):
+    try:
+        from packaging.version import Version
+        return Version(v)
+    except Exception:
+        return v
+
+# ======================
+# App
+# ======================
+app = FastAPI(title="AutoLoad CMD - Updater Management System", version="1.1")
+init_db_and_migrate()
+log_event("Server started.")
+
+ADMIN_UI_ENABLED = ADMIN_DIST_DIR.exists() and (ADMIN_DIST_DIR / "index.html").exists()
+if ADMIN_UI_ENABLED:
+    app.mount("/admin", StaticFiles(directory=str(ADMIN_DIST_DIR), html=True), name="admin")
+    log_event("Admin UI enabled at /admin (served from web/dist).")
+else:
+    log_event("Admin UI not found (web/dist). Using built-in HTML UI at /.")
+
+# ======================
+# UI (Dashboard + Edit/Replace/Set Live)
+# ======================
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AUTOLOAD CMD</title>
+  <style>
+    :root{
+      --bg:#070b12; --bg2:#060914;
+      --panel:#0b1320; --line:#142033;
+      --text:#d9e2f2; --muted:#7f93b5;
+      --green:#1fe38b; --green2:#00c07a;
+      --warn:#ffcc66; --danger:#ff8f8f;
+      --shadow: 0 14px 40px rgba(0,0,0,.45);
+      --r:18px; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+    }
+    *{ box-sizing:border-box; }
+    body{
+      margin:0; color:var(--text); font-family:var(--sans);
+      background:
+        radial-gradient(1200px 700px at 60% 55%, rgba(31,227,139,.08), transparent 65%),
+        radial-gradient(900px 600px at 30% 35%, rgba(0,192,122,.06), transparent 60%),
+        linear-gradient(180deg, var(--bg), var(--bg2));
+      min-height:100vh; overflow-x:hidden;
+    }
+    .layout{ display:grid; grid-template-columns: 260px 1fr; min-height:100vh; }
+    .sidebar{
+      border-right:1px solid rgba(20,32,51,.7);
+      background: linear-gradient(180deg, rgba(8,13,22,.85), rgba(7,10,18,.85));
+      padding:18px 14px; position:sticky; top:0; height:100vh;
+    }
+    .brand{ display:flex; align-items:center; gap:10px; padding:8px 10px 16px; }
+    .dot{ width:10px; height:10px; border-radius:50%; background:var(--green); box-shadow:0 0 18px rgba(31,227,139,.55); }
+    .brand h1{ font-size:18px; margin:0; letter-spacing:.4px; }
+    .brand h1 span{ color:var(--green); }
+    .brand .sub{ margin-top:3px; font-size:12px; color:var(--muted); }
+
+    .nav{ margin-top:10px; display:flex; flex-direction:column; gap:8px; }
+    .nav a{
+      text-decoration:none; color:var(--muted);
+      padding:12px 12px; border-radius:12px;
+      display:flex; align-items:center; gap:10px;
+      border:1px solid transparent; transition:.15s;
+    }
+    .nav a:hover{ color:var(--text); background:rgba(16,26,45,.55); border-color:rgba(20,32,51,.8); }
+    .nav a.active{
+      color:var(--green);
+      background:rgba(16,40,36,.35);
+      border-color:rgba(31,227,139,.25);
+      box-shadow: inset 0 0 0 1px rgba(31,227,139,.08);
+    }
+
+    .statusBox{
+      position:absolute; left:14px; right:14px; bottom:14px;
+      border:1px solid rgba(20,32,51,.85);
+      background:rgba(8,13,22,.55);
+      border-radius:14px; padding:12px;
+    }
+    .statusRow{ display:flex; justify-content:space-between; align-items:center; }
+    .statusTitle{ font-size:11px; color:var(--muted); letter-spacing:.6px; }
+    .statusState{ font-size:11px; color:var(--green); font-family:var(--mono); }
+    .bar{ height:6px; border-radius:999px; background:rgba(20,32,51,.85); margin-top:10px; overflow:hidden; }
+    .bar > div{ height:100%; width:70%; background:linear-gradient(90deg, var(--green2), var(--green)); }
+
+    .main{ padding:22px 26px; }
+    .topbar{ display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; gap:12px; flex-wrap:wrap; }
+    .crumb{ color:var(--muted); font-size:13px; letter-spacing:.2px; }
+    .crumb b{ color:var(--text); font-weight:600; }
+    .badge{
+      display:inline-flex; align-items:center; gap:10px;
+      padding:8px 12px; border-radius:999px;
+      border:1px solid rgba(31,227,139,.25);
+      background:rgba(16,40,36,.35);
+      color:var(--green);
+      font-size:12px; font-family:var(--mono);
+    }
+    .badge .dot2{ width:8px; height:8px; border-radius:50%; background:var(--green); }
+
+    .grid3{ display:grid; grid-template-columns: 1.15fr 1fr 1fr; gap:14px; }
+    @media (max-width:1100px){ .layout{ grid-template-columns: 240px 1fr; } .grid3{ grid-template-columns: 1fr; } }
+    .card{
+      border:1px solid rgba(20,32,51,.85);
+      background: linear-gradient(180deg, rgba(11,19,32,.85), rgba(9,14,26,.85));
+      border-radius: var(--r);
+      padding:18px 18px;
+      box-shadow: var(--shadow);
+      position:relative; overflow:hidden; min-height:120px;
+    }
+    .card .title{ color:var(--muted); font-size:13px; margin-bottom:12px; }
+    .big{ font-family:var(--mono); font-size:44px; letter-spacing:2px; margin:4px 0 6px; font-weight:800; color:#fff; }
+    .bigSmall{ font-family:var(--mono); font-size:38px; letter-spacing:1.2px; margin:6px 0 6px; font-weight:800; color:#fff; }
+    .hint{ display:flex; align-items:center; gap:8px; font-size:12px; color:var(--green); margin-top:8px; }
+    .hintWarn{ color:var(--warn); }
+
+    .panel{
+      margin-top:14px;
+      border:1px solid rgba(20,32,51,.85);
+      background: rgba(10,16,32,.55);
+      border-radius: var(--r);
+      padding:16px;
+      box-shadow: var(--shadow);
+    }
+    .panelHead{ display:flex; align-items:center; justify-content:space-between; gap:10px; color:#fff; font-weight:700; margin-bottom:12px; }
+    .terminal{
+      border:1px solid rgba(20,32,51,.85);
+      background: rgba(7,10,18,.75);
+      border-radius:14px;
+      padding:14px; min-height:240px;
+      font-family:var(--mono); font-size:12.5px;
+      color: rgba(217,226,242,.75);
+      overflow:auto; white-space:pre-wrap; line-height:1.5;
+    }
+    .lineDim{ color: rgba(217,226,242,.42); }
+
+    .row{ display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+    @media (max-width:1100px){ .row{ grid-template-columns: 1fr; } }
+
+    label{ font-size:12px; color:var(--muted); display:block; margin-bottom:6px; }
+    input, button, textarea{
+      width:100%;
+      padding:11px 12px;
+      border-radius:12px;
+      border:1px solid rgba(20,32,51,.9);
+      background: rgba(7,10,18,.7);
+      color:var(--text);
+      outline:none;
+      font-family:var(--sans);
+    }
+    textarea{ min-height:88px; resize:vertical; }
+    input[type=file]{ padding:10px; }
+    button{
+      cursor:pointer;
+      background: rgba(16,40,36,.35);
+      border-color: rgba(31,227,139,.25);
+      color: var(--green);
+      font-weight:700;
+      transition:.15s;
+      width:auto;
+    }
+    button:hover{ background: rgba(16,40,36,.5); }
+    .btnRow{ display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+
+    .mono{ font-family:var(--mono); }
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:6px 10px; border-radius:999px;
+      border:1px solid rgba(20,32,51,.85);
+      background: rgba(7,10,18,.55);
+      color: var(--muted);
+      font-size:12px;
+    }
+    .pillLive{ border-color: rgba(31,227,139,.35); color: var(--green); background: rgba(16,40,36,.35); }
+    .hidden{ display:none; }
+
+    table{ width:100%; border-collapse:collapse; }
+    th, td{ padding:10px 8px; border-top:1px solid rgba(20,32,51,.75); text-align:left; font-size:13px; vertical-align:top; }
+    th{ color:var(--muted); font-weight:600; }
+
+    .dangerBtn{ color:var(--danger); border-color: rgba(255,143,143,.25); background: rgba(70,20,20,.25); }
+    .dangerBtn:hover{ background: rgba(90,25,25,.35); }
+
+    .codeBox{
+      border:1px solid rgba(20,32,51,.85);
+      background: rgba(7,10,18,.75);
+      border-radius:14px;
+      padding:14px;
+      font-family:var(--mono);
+      font-size:12.5px;
+      color: rgba(217,226,242,.82);
+      overflow:auto;
+      white-space:pre;
+      line-height:1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="dot"></div>
+        <div>
+          <h1><span>AUTOLOAD</span> CMD</h1>
+          <div class="sub">Updater Management System</div>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a href="#overview" id="navOverview" class="active"><span>▦</span> Overview</a>
+        <a href="#config" id="navConfig"><span>⚙</span> Configuration</a>
+        <a href="#python" id="navPython"><span>⌁</span> Python Client</a>
+      </nav>
+
+      <div class="statusBox">
+        <div class="statusRow">
+          <div class="statusTitle">STATUS</div>
+          <div class="statusState" id="statusText">CHECKING</div>
+        </div>
+        <div class="bar"><div id="statusBar"></div></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div class="crumb"><span class="lineDim">workspace</span> / <b id="pageTitle">Overview</b></div>
+        <div class="badge" id="apiBadge"><span class="dot2"></span> API CONNECTED</div>
+      </div>
+
+      <section id="pageOverview">
+        <div class="grid3">
+          <div class="card">
+            <div class="title">Current Live Version</div>
+            <div class="big" id="liveVersion">—</div>
+            <div class="hint"><span>◉</span><span id="deployState">Deployment Active</span></div>
+          </div>
+
+          <div class="card">
+            <div class="title">Stealth Mode</div>
+            <div class="bigSmall" id="stealthState">ACTIVE</div>
+            <div class="hint hintWarn"><span>◉</span><span id="hiddenFileText">Hidden File: version_info.dat</span></div>
+          </div>
+
+          <div class="card">
+            <div class="title">Bot Integration</div>
+            <div class="bigSmall">READY</div>
+            <div class="hint"><span>↗</span><span class="mono" id="endpointText">Endpoint Configured</span></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panelHead">
+            <div>›_ System Logs</div>
+            <div class="pill mono" id="manifestUrlTop">—</div>
+          </div>
+          <div class="terminal" id="logBox"><span class="lineDim">Waiting for activity...</span></div>
+        </div>
+      </section>
+
+      <section id="pageConfig" class="hidden">
+        <div class="row">
+          <div class="panel">
+            <div class="panelHead"><div>⚙ Upload / Edit</div></div>
+
+            <div style="display:grid; gap:12px;">
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+                <div>
+                  <label>App ID</label>
+                  <input id="cfgAppId" placeholder="เช่น 1999x" />
+                </div>
+                <div>
+                  <label>Version</label>
+                  <input id="cfgVersion" placeholder="เช่น 1.0.1" />
+                </div>
+              </div>
+
+              <div>
+                <label>Notes (optional)</label>
+                <textarea id="cfgNotes" placeholder="release notes / memo..."></textarea>
+              </div>
+
+              <div>
+                <label>File</label>
+                <input id="cfgFile" type="file" />
+              </div>
+
+              <div class="btnRow">
+                <button onclick="doUpload()">Upload (new record)</button>
+                <button onclick="refreshAll()">Refresh</button>
+                <button onclick="copyManifest()">Copy Manifest URL</button>
+              </div>
+
+              <div style="color:var(--muted); font-size:12px;" id="cfgMsg">—</div>
+              <div>
+                <span class="pill">Manifest:</span>
+                <span class="pill mono" id="manifestUrl">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panelHead">
+              <div>▦ Versions</div>
+              <div class="pill mono" id="livePill">LIVE: —</div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>version</th>
+                  <th>file</th>
+                  <th>sha256</th>
+                  <th>rev</th>
+                  <th>notes</th>
+                  <th>actions</th>
+                </tr>
+              </thead>
+              <tbody id="verBody">
+                <tr><td colspan="6" style="color:var(--muted);">—</td></tr>
+              </tbody>
+            </table>
+            <input id="replaceInput" type="file" class="hidden" />
+          </div>
+        </div>
+      </section>
+
+      <section id="pagePython" class="hidden">
+        <div class="panel">
+          <div class="panelHead"><div>⌁ Python Client (Auto Update)</div></div>
+          <div style="color:var(--muted); font-size:12px; margin-bottom:10px;">
+            ค่าเวอร์ชั่นจะถูกเก็บในไฟล์ <span class="mono" id="pyHidden">version_info.dat</span>
+            (ถ้าเวอร์ชั่นเดิมจะไม่โหลดซ้ำ)
+          </div>
+          <div class="btnRow">
+            <button onclick="copyPython()">Copy Python</button>
+          </div>
+          <div class="codeBox" id="pyCode"></div>
+          <div style="margin-top:10px; color:var(--warn); font-size:12px;">
+            * ถ้าคุณ “Replace ไฟล์เดิมโดยไม่เปลี่ยน version” → client ที่เช็คเฉพาะ version จะไม่โหลดซ้ำตามเงื่อนไขเดิม
+            (ถ้าอยากบังคับให้โหลด ให้เพิ่ม version หรือปรับ client ให้เช็ค sha/revision เพิ่ม)
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+<script>
+  const api = (p) => `${location.origin}${p}`;
+  const $ = (id) => document.getElementById(id);
+
+  function setPage(hash){
+    const page = (hash || "#overview").replace("#","");
+    $("pageTitle").textContent = page.charAt(0).toUpperCase()+page.slice(1);
+
+    ["Overview","Config","Python"].forEach(k => $("nav"+k).classList.remove("active"));
+    $("pageOverview").classList.add("hidden");
+    $("pageConfig").classList.add("hidden");
+    $("pagePython").classList.add("hidden");
+
+    if(page === "config"){
+      $("navConfig").classList.add("active");
+      $("pageConfig").classList.remove("hidden");
+    }else if(page === "python"){
+      $("navPython").classList.add("active");
+      $("pagePython").classList.remove("hidden");
+    }else{
+      $("navOverview").classList.add("active");
+      $("pageOverview").classList.remove("hidden");
+    }
+  }
+
+  function getAppId(){
+    const v = $("cfgAppId").value.trim() || localStorage.getItem("app_id") || "1999x";
+    $("cfgAppId").value = v;
+    localStorage.setItem("app_id", v);
+    return v;
+  }
+
+  async function checkHealth(){
+    try{
+      const r = await fetch(api("/api/health"), {cache:"no-store"});
+      if(!r.ok) throw new Error("bad");
+      $("apiBadge").style.borderColor = "rgba(31,227,139,.25)";
+      $("apiBadge").style.color = "var(--green)";
+      $("apiBadge").innerHTML = `<span class="dot2"></span> API CONNECTED`;
+      $("statusText").textContent = "ONLINE";
+      $("statusText").style.color = "var(--green)";
+      $("statusBar").style.width = "78%";
+    }catch(e){
+      $("apiBadge").style.borderColor = "rgba(255,160,160,.25)";
+      $("apiBadge").style.color = "rgba(255,160,160,.95)";
+      $("apiBadge").innerHTML = `<span class="dot2" style="background:#ff8f8f"></span> API DISCONNECTED`;
+      $("statusText").textContent = "OFFLINE";
+      $("statusText").style.color = "rgba(255,160,160,.95)";
+      $("statusBar").style.width = "22%";
+    }
+  }
+
+  async function loadConfig(){
+    const r = await fetch(api("/api/config"), {cache:"no-store"});
+    const c = await r.json();
+    $("stealthState").textContent = c.stealth_mode ? "ACTIVE" : "OFF";
+    $("hiddenFileText").textContent = `Hidden File: ${c.hidden_version_file}`;
+    $("pyHidden").textContent = c.hidden_version_file;
+
+    const appId = getAppId();
+    const code =
+`import os, hashlib, requests
+from packaging.version import Version
+
+SERVER = "${location.origin}"
+APP_ID = "${appId}"
+MANIFEST_URL = f"{SERVER}/api/{appId}/latest"
+VERSION_FILE = r"${c.hidden_version_file}"
+OUT_FILE = "update.bin"  # เปลี่ยนเป็น .exe/.zip ได้
+
+def read_ver():
+    if os.path.exists(VERSION_FILE):
+        return open(VERSION_FILE, "r", encoding="utf-8").read().strip() or "0.0.0"
+    return "0.0.0"
+
+def write_ver(v):
+    with open(VERSION_FILE, "w", encoding="utf-8") as f:
+        f.write(v)
+
+def sha256_path(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def download(url, out_path):
+    with requests.get(url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(1024*1024):
+                if chunk:
+                    f.write(chunk)
+
+def main():
+    cur = read_ver()
+    m = requests.get(MANIFEST_URL, timeout=30).json()
+    latest = m["version"]
+
+    # ไม่โหลดซ้ำถ้าเวอร์ชั่นเดิม
+    if Version(latest) <= Version(cur):
+        print(f"Up-to-date (skip). current={cur}, latest={latest}")
+        return
+
+    url = SERVER + m["download_url"]
+    print("New version:", cur, "->", latest)
+    download(url, OUT_FILE)
+
+    # ตรวจ sha256 เพื่อความปลอดภัย/กันไฟล์เสีย
+    if sha256_path(OUT_FILE).lower() != m["sha256"].lower():
+        raise SystemExit("SHA256 mismatch!")
+
+    write_ver(latest)
+    print("Downloaded OK. Saved version:", latest)
+
+if __name__ == "__main__":
+    main()
+`;
+    $("pyCode").textContent = code;
+  }
+
+  async function refreshLatest(){
+    const appId = getAppId();
+    const manifest = api(`/api/${encodeURIComponent(appId)}/latest`);
+    $("manifestUrl").textContent = manifest;
+    $("manifestUrlTop").textContent = manifest;
+
+    try{
+      const r = await fetch(manifest, {cache:"no-store"});
+      if(!r.ok) throw new Error();
+      const m = await r.json();
+      $("liveVersion").textContent = m.version;
+      $("deployState").textContent = "Deployment Active";
+      $("endpointText").textContent = `Endpoint Configured`;
+    }catch{
+      $("liveVersion").textContent = "—";
+      $("deployState").textContent = "No Deployment";
+    }
+
+    // live info
+    const r2 = await fetch(api(`/api/${encodeURIComponent(appId)}/live`), {cache:"no-store"});
+    if(r2.ok){
+      const live = await r2.json();
+      $("livePill").textContent = live.live_file_id ? `LIVE: #${live.live_file_id}` : "LIVE: (auto latest)";
+    }
+  }
+
+  async function refreshVersions(){
+    const appId = getAppId();
+    const body = $("verBody");
+    body.innerHTML = `<tr><td colspan="6" style="color:var(--muted);">Loading...</td></tr>`;
+    const r = await fetch(api(`/api/${encodeURIComponent(appId)}/versions`), {cache:"no-store"});
+    if(!r.ok){
+      body.innerHTML = `<tr><td colspan="6" style="color:var(--danger);">Load failed</td></tr>`;
+      return;
+    }
+    const list = await r.json();
+    if(!list.length){
+      body.innerHTML = `<tr><td colspan="6" style="color:var(--muted);">—</td></tr>`;
+      return;
+    }
+
+    // get live id
+    let liveId = null;
+    const lr = await fetch(api(`/api/${encodeURIComponent(appId)}/live`), {cache:"no-store"});
+    if(lr.ok){
+      const l = await lr.json();
+      liveId = l.live_file_id;
+    }
+
+    body.innerHTML = "";
+    for(const it of list){
+      const isLive = (liveId && it.id === liveId);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${it.version}${isLive ? ' <span class="pill pillLive">LIVE</span>' : ''}</td>
+        <td class="mono">${it.original_name}</td>
+        <td class="mono">${it.sha256.slice(0,16)}…</td>
+        <td class="mono">${it.revision ?? 1}</td>
+        <td>${(it.notes || '').toString().slice(0,80)}</td>
+        <td>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button onclick="window.open('${it.download_url}','_blank')">download</button>
+            <button onclick="setLive(${it.id})">set live</button>
+            <button onclick="editMeta(${it.id}, '${it.version.replaceAll("'", "\\'")}', '${(it.notes||"").toString().replaceAll("'", "\\'")}')">edit</button>
+            <button class="dangerBtn" onclick="replaceFile(${it.id})">replace file</button>
+          </div>
+        </td>
+      `;
+      body.appendChild(tr);
+    }
+  }
+
+  async function refreshLogs(){
+    const box = $("logBox");
+    const r = await fetch(api("/api/logs?limit=140"), {cache:"no-store"});
+    const data = await r.json();
+    if(!data.length){
+      box.innerHTML = `<span class="lineDim">Waiting for activity...</span>`;
+      return;
+    }
+    box.textContent = data.map(x => `[${x.ts}] ${x.msg}`).join("\n");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function doUpload(){
+    const appId = getAppId();
+    const version = $("cfgVersion").value.trim();
+    const notes = $("cfgNotes").value.trim();
+    const f = $("cfgFile").files[0];
+    if(!version){ $("cfgMsg").textContent = "กรอก version"; return; }
+    if(!f){ $("cfgMsg").textContent = "เลือกไฟล์"; return; }
+
+    const fd = new FormData();
+    fd.append("app_id", appId);
+    fd.append("version", version);
+    fd.append("notes", notes);
+    fd.append("file", f);
+
+    $("cfgMsg").textContent = "Uploading...";
+    const res = await fetch(api("/api/upload"), {method:"POST", body:fd});
+    const data = await res.json();
+    if(!res.ok){ $("cfgMsg").textContent = data.detail || "Upload failed"; return; }
+    $("cfgMsg").textContent = `Uploaded: ${data.original_name} (${data.version}) #${data.id}`;
+    await refreshAll();
+  }
+
+  async function setLive(fileId){
+    const appId = getAppId();
+    const res = await fetch(api(`/api/${encodeURIComponent(appId)}/set-live`), {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ file_id: fileId })
+    });
+    const data = await res.json();
+    if(!res.ok){ $("cfgMsg").textContent = data.detail || "set live failed"; return; }
+    $("cfgMsg").textContent = `Set LIVE: #${fileId}`;
+    await refreshAll();
+  }
+
+  async function editMeta(fileId, curVersion, curNotes){
+    const v = prompt("แก้ version (ปล่อยว่าง = ไม่เปลี่ยน)", curVersion);
+    if(v === null) return;
+    const n = prompt("แก้ notes (ปล่อยว่างได้)", curNotes || "");
+    if(n === null) return;
+
+    const payload = {};
+    if(v.trim()) payload.version = v.trim();
+    payload.notes = n;
+
+    const res = await fetch(api(`/api/file/${fileId}`), {
+      method:"PATCH",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if(!res.ok){ $("cfgMsg").textContent = data.detail || "edit failed"; return; }
+    $("cfgMsg").textContent = `Edited #${fileId}`;
+    await refreshAll();
+  }
+
+  function replaceFile(fileId){
+    const inp = $("replaceInput");
+    inp.value = "";
+    inp.onchange = async () => {
+      const f = inp.files[0];
+      if(!f) return;
+      const fd = new FormData();
+      fd.append("file", f);
+
+      $("cfgMsg").textContent = `Replacing file for #${fileId} ...`;
+      const res = await fetch(api(`/api/file/${fileId}/replace`), {method:"PUT", body:fd});
+      const data = await res.json();
+      if(!res.ok){ $("cfgMsg").textContent = data.detail || "replace failed"; return; }
+      $("cfgMsg").textContent = `Replaced #${fileId} → rev ${data.revision}`;
+      await refreshAll();
+    };
+    inp.click();
+  }
+
+  function copyManifest(){
+    const txt = $("manifestUrl").textContent;
+    navigator.clipboard.writeText(txt);
+    $("cfgMsg").textContent = "Copied manifest URL";
+  }
+  function copyPython(){
+    navigator.clipboard.writeText($("pyCode").textContent);
+  }
+
+  async function refreshAll(){
+    await checkHealth();
+    await loadConfig();
+    await refreshLatest();
+    await refreshVersions();
+    await refreshLogs();
+  }
+
+  window.addEventListener("hashchange", () => setPage(location.hash));
+  setPage(location.hash);
+
+  $("cfgAppId").value = localStorage.getItem("app_id") || "1999x";
+  $("cfgVersion").value = "1.0.0";
+
+  refreshAll();
+  setInterval(checkHealth, 3000);
+  setInterval(refreshLogs, 2000);
+</script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    if ADMIN_UI_ENABLED:
+        return RedirectResponse(url="/admin", status_code=307)
+    return HTMLResponse(INDEX_HTML)
+
+@app.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
+
+# ======================
+# API
+# ======================
+@app.get("/api/health")
+def api_health():
+    return {"ok": True, "time": utc_now_iso()}
+
+@app.get("/api/config")
+def api_config():
+    return {
+        "stealth_mode": STEALTH_MODE,
+        "hidden_version_file": HIDDEN_VERSION_FILE,
+        "max_upload_mb": MAX_SIZE_MB,
+    }
+
+@app.get("/api/logs")
+def api_logs(limit: int = 140):
+    limit = max(10, min(limit, MAX_LOG_LINES))
+    return JSONResponse(LOGS[-limit:])
+
+def upsert_app(app_id: str):
+    conn = db()
+    now = utc_now_iso()
+    row = conn.execute("SELECT app_id FROM apps WHERE app_id=?", (app_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE apps SET updated_at=? WHERE app_id=?", (now, app_id))
+    else:
+        conn.execute("INSERT INTO apps(app_id, live_file_id, created_at, updated_at) VALUES(?,?,?,?)",
+                     (app_id, None, now, now))
+    conn.commit()
+    conn.close()
+
+def get_live_file_id(app_id: str) -> Optional[int]:
+    conn = db()
+    row = conn.execute("SELECT live_file_id FROM apps WHERE app_id=?", (app_id,)).fetchone()
+    conn.close()
+    return row["live_file_id"] if row and row["live_file_id"] is not None else None
+
+@app.get("/api/{app_id}/live")
+def api_get_live(app_id: str):
+    upsert_app(app_id)
+    return {"app_id": app_id, "live_file_id": get_live_file_id(app_id)}
+
+@app.post("/api/{app_id}/set-live")
+async def api_set_live(app_id: str, payload: Dict[str, Any]):
+    file_id = payload.get("file_id")
+    if file_id is None:
+        raise HTTPException(400, "file_id required")
+
+    conn = db()
+    row = conn.execute("SELECT id FROM files WHERE id=? AND app_id=?", (file_id, app_id)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "file_id not found for this app_id")
+
+    now = utc_now_iso()
+    upsert_app(app_id)
+    conn = db()
+    conn.execute("UPDATE apps SET live_file_id=?, updated_at=? WHERE app_id=?", (file_id, now, app_id))
+    conn.commit()
+    conn.close()
+
+    log_event(f"SET_LIVE app_id={app_id} live_file_id={file_id}")
+    return {"ok": True, "app_id": app_id, "live_file_id": file_id}
+
+@app.post("/api/upload")
+async def api_upload(
+    request: Request,
+    app_id: str = Form(...),
+    version: str = Form(...),
+    notes: str = Form(""),
+    file: UploadFile = File(...)
+):
+    app_id = app_id.strip()
+    version = version.strip()
+
+    if not app_id:
+        raise HTTPException(400, "app_id required")
+    if not is_valid_version(version):
+        raise HTTPException(400, "invalid version format (use 1.2.3 / 2026.01.26 / etc.)")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(400, f"File type not allowed: {ext}")
+
+    safe_app = re.sub(r"[^0-9A-Za-z._-]+", "_", app_id)
+    safe_ver = re.sub(r"[^0-9A-Za-z._-]+", "_", version)
+    dest_dir = UPLOAD_DIR / safe_app / safe_ver
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    stored_name = re.sub(r"[^0-9A-Za-z._-]+", "_", file.filename)
+    dest_path = dest_dir / stored_name
+
+    size = 0
+    h = hashlib.sha256()
+
+    with dest_path.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SIZE_MB * 1024 * 1024:
+                out.close()
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise HTTPException(413, f"File too large (> {MAX_SIZE_MB} MB)")
+            out.write(chunk)
+            h.update(chunk)
+
+    sha = h.hexdigest()
+    now = utc_now_iso()
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO files(app_id, version, original_name, stored_path, size_bytes, sha256, created_at, updated_at, notes, revision)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (app_id, version, file.filename, str(dest_path), size, sha, now, now, notes, 1))
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+
+    upsert_app(app_id)
+
+    ip = request.client.host if request.client else "unknown"
+    log_event(f"UPLOAD app_id={app_id} version={version} file_id={row_id} file={file.filename} size={size/1024/1024:.2f}MB ip={ip}")
+
+    return {
+        "id": row_id,
+        "app_id": app_id,
+        "version": version,
+        "original_name": file.filename,
+        "size_bytes": size,
+        "sha256": sha,
+        "revision": 1,
+        "notes": notes,
+        "created_at": now,
+        "updated_at": now,
+        "download_url": f"/api/download/{row_id}",
+    }
+
+@app.get("/api/{app_id}/versions")
+def api_versions(app_id: str):
+    upsert_app(app_id)
+    conn = db()
+    rows = conn.execute("""
+      SELECT id, app_id, version, original_name, size_bytes, sha256, created_at, updated_at, notes, revision
+      FROM files
+      WHERE app_id=?
+    """, (app_id,)).fetchall()
+    conn.close()
+
+    items = [{
+        "id": r["id"],
+        "app_id": r["app_id"],
+        "version": r["version"],
+        "original_name": r["original_name"],
+        "size_bytes": r["size_bytes"],
+        "sha256": r["sha256"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+        "notes": r["notes"],
+        "revision": r["revision"] if r["revision"] is not None else 1,
+        "download_url": f"/api/download/{r['id']}",
+    } for r in rows]
+
+    items.sort(key=lambda x: version_key(x["version"]), reverse=True)
+    return JSONResponse(items)
+
+@app.get("/api/{app_id}/latest")
+def api_latest(app_id: str):
+    upsert_app(app_id)
+
+    live_id = get_live_file_id(app_id)
+    conn = db()
+
+    # if live is set → return that build
+    if live_id is not None:
+        r = conn.execute("""
+          SELECT id, app_id, version, original_name, size_bytes, sha256, created_at, updated_at, notes, revision
+          FROM files WHERE id=? AND app_id=?
+        """, (live_id, app_id)).fetchone()
+        conn.close()
+        if not r:
+            raise HTTPException(404, "Live build missing")
+        return JSONResponse({
+            "app_id": r["app_id"],
+            "version": r["version"],
+            "original_name": r["original_name"],
+            "size_bytes": r["size_bytes"],
+            "sha256": r["sha256"],
+            "revision": r["revision"] if r["revision"] is not None else 1,
+            "notes": r["notes"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "download_url": f"/api/download/{r['id']}",
+        })
+
+    # else auto-latest by version
+    rows = conn.execute("""
+      SELECT id, app_id, version, original_name, size_bytes, sha256, created_at, updated_at, notes, revision
+      FROM files
+      WHERE app_id=?
+    """, (app_id,)).fetchall()
+    conn.close()
+
+    if not rows:
+        raise HTTPException(404, "No files for this app_id")
+
+    items = [dict(r) for r in rows]
+    items.sort(key=lambda x: version_key(x["version"]), reverse=True)
+    top = items[0]
+
+    return JSONResponse({
+        "app_id": top["app_id"],
+        "version": top["version"],
+        "original_name": top["original_name"],
+        "size_bytes": top["size_bytes"],
+        "sha256": top["sha256"],
+        "revision": top["revision"] if top["revision"] is not None else 1,
+        "notes": top["notes"],
+        "created_at": top["created_at"],
+        "updated_at": top["updated_at"],
+        "download_url": f"/api/download/{top['id']}",
+    })
+
+@app.get("/api/download/{file_id}")
+def api_download(file_id: int, request: Request):
+    conn = db()
+    r = conn.execute("""
+      SELECT app_id, version, original_name, stored_path, revision
+      FROM files WHERE id=?
+    """, (file_id,)).fetchone()
+    conn.close()
+
+    if not r:
+        raise HTTPException(404, "Not found")
+
+    path = Path(r["stored_path"])
+    if not path.exists():
+        raise HTTPException(404, "File missing on disk")
+
+    ip = request.client.host if request.client else "unknown"
+    log_event(f"DOWNLOAD id={file_id} app_id={r['app_id']} version={r['version']} rev={r['revision']} ip={ip}")
+
+    return FileResponse(str(path), filename=r["original_name"], media_type="application/octet-stream")
+
+# ---------- EDIT METADATA ----------
+@app.patch("/api/file/{file_id}")
+async def api_edit_file(file_id: int, payload: Dict[str, Any]):
+    new_version = payload.get("version")
+    notes = payload.get("notes")
+
+    if new_version is not None:
+        new_version = str(new_version).strip()
+        if not new_version:
+            new_version = None
+        elif not is_valid_version(new_version):
+            raise HTTPException(400, "invalid version format")
+
+    conn = db()
+    row = conn.execute("SELECT id, app_id, version FROM files WHERE id=?", (file_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "not found")
+
+    now = utc_now_iso()
+    if new_version is not None and new_version != row["version"]:
+        conn.execute("UPDATE files SET version=?, updated_at=? WHERE id=?", (new_version, now, file_id))
+        log_event(f"EDIT_META id={file_id} version {row['version']} -> {new_version}")
+    if notes is not None:
+        conn.execute("UPDATE files SET notes=?, updated_at=? WHERE id=?", (str(notes), now, file_id))
+        log_event(f"EDIT_META id={file_id} notes updated")
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "id": file_id}
+
+# ---------- REPLACE FILE CONTENT ----------
+@app.put("/api/file/{file_id}/replace")
+async def api_replace_file(file_id: int, request: Request, file: UploadFile = File(...)):
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(400, f"File type not allowed: {ext}")
+
+    conn = db()
+    r = conn.execute("""
+      SELECT id, app_id, version, original_name, stored_path, revision
+      FROM files WHERE id=?
+    """, (file_id,)).fetchone()
+    if not r:
+        conn.close()
+        raise HTTPException(404, "not found")
+
+    app_id = r["app_id"]
+    version = r["version"]
+    old_path = Path(r["stored_path"])
+    rev = (r["revision"] if r["revision"] is not None else 1) + 1
+
+    safe_app = re.sub(r"[^0-9A-Za-z._-]+", "_", app_id)
+    safe_ver = re.sub(r"[^0-9A-Za-z._-]+", "_", version)
+    dest_dir = UPLOAD_DIR / safe_app / safe_ver
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    stored_name = re.sub(r"[^0-9A-Za-z._-]+", "_", file.filename)
+    new_path = dest_dir / stored_name
+
+    # write new file
+    size = 0
+    h = hashlib.sha256()
+    with new_path.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SIZE_MB * 1024 * 1024:
+                out.close()
+                try:
+                    new_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                conn.close()
+                raise HTTPException(413, f"File too large (> {MAX_SIZE_MB} MB)")
+            out.write(chunk)
+            h.update(chunk)
+
+    sha = h.hexdigest()
+    now = utc_now_iso()
+
+    # delete old file if different
+    try:
+        if old_path.exists() and old_path.resolve() != new_path.resolve():
+            old_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    conn.execute("""
+      UPDATE files
+      SET original_name=?, stored_path=?, size_bytes=?, sha256=?, updated_at=?, revision=?
+      WHERE id=?
+    """, (file.filename, str(new_path), size, sha, now, rev, file_id))
+    conn.commit()
+    conn.close()
+
+    ip = request.client.host if request.client else "unknown"
+    log_event(f"REPLACE_FILE id={file_id} app_id={app_id} version={version} rev={rev} file={file.filename} ip={ip}")
+
+    return {
+        "ok": True,
+        "id": file_id,
+        "app_id": app_id,
+        "version": version,
+        "revision": rev,
+        "original_name": file.filename,
+        "size_bytes": size,
+        "sha256": sha,
+        "updated_at": now,
+        "download_url": f"/api/download/{file_id}",
+    }
